@@ -6,7 +6,6 @@ import torch.nn as nn
 import joblib
 import json
 import plotly.graph_objects as go
-# Không cần make_subplots nữa vì ta sẽ vẽ riêng lẻ
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
@@ -207,9 +206,10 @@ def load_system_components():
         model.load_state_dict(torch.load(model_path, map_location='cpu'))
         model.eval()
         
-        #quantized_model = torch.quantization.quantize_dynamic(
-            #model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
-        #)
+        # --- FIX OOM: BỎ QUANTIZATION ĐỂ TRÁNH LỖI RAM & WARNING ---
+        # quantized_model = torch.quantization.quantize_dynamic(
+        #     model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
+        # )
         return model, scaler, config
     except Exception as e:
         st.error(f"Lỗi load model: {str(e)}")
@@ -218,7 +218,7 @@ def load_system_components():
 model, scaler, config = load_system_components()
 
 if not model:
-    st.error("⚠️ Không tìm thấy Model!")
+    st.error("⚠️ Không tìm thấy Model hoặc File Config! Hãy kiểm tra lại file .pkl và .pth")
     st.stop()
 
 # Session State
@@ -270,7 +270,8 @@ if uploaded_file:
         df_machine = df_processed[df_processed['Label'] == selected_dev].sort_values('time')
 
         with st.expander("🔍 Xem dữ liệu thô"):
-            st.dataframe(df_machine.head(100))
+            # FIX WARNING: use_container_width -> width="stretch"
+            st.dataframe(df_machine.head(100), width=1000) 
 
         if len(df_machine) < config['seq_length'] + 5:
             st.warning(f"⚠️ Dữ liệu quá ngắn.")
@@ -287,30 +288,49 @@ if uploaded_file:
                     
                     seq_len = config['seq_length']
                     step_size = 10 if turbo_mode else 1
+                    
+                    # Create Indexes
                     indexes = range(0, len(data_vals) - seq_len, step_size)
-                    sequences = [data_vals[i:i+seq_len] for i in indexes]
-
-                    if not sequences:
-                        st.error("Lỗi tạo sequence.")
+                    indexes_list = list(indexes)
+                    
+                    if not indexes_list:
+                        st.error("Dữ liệu không đủ để tạo sequence.")
                         st.stop()
 
-                    X_input = torch.tensor(np.array(sequences), dtype=torch.float32)
-                    dataset = torch.utils.data.TensorDataset(X_input)
-                    dataloader = torch.utils.data.DataLoader(dataset, batch_size=2048, shuffle=False)
-
-                    # 2. Run Model
+                    # --- FIX OOM (CRASH): XỬ LÝ THEO BATCH NHỎ ---
+                    # Thay vì tạo mảng sequences khổng lồ cùng lúc, ta cắt nhỏ và dự đoán cuốn chiếu
+                    BATCH_SIZE = 512 # Giảm batch để nhẹ RAM
                     all_preds = []
-                    prog_bar = st.progress(0, text="🤖 AI đang phân tích...")
+                    
+                    prog_bar = st.progress(0, text="🤖 AI đang phân tích (Chế độ tiết kiệm RAM)...")
+                    
+                    total_batches = len(indexes_list) // BATCH_SIZE + 1
+                    
                     with torch.no_grad():
-                        for i, batch in enumerate(dataloader):
-                            preds = model(batch[0])
+                        for i in range(0, len(indexes_list), BATCH_SIZE):
+                            batch_idxs = indexes_list[i : i + BATCH_SIZE]
+                            if not batch_idxs: break
+                            
+                            # Tạo batch dữ liệu ngay tại chỗ (On-the-fly)
+                            batch_seqs = [data_vals[j : j + seq_len] for j in batch_idxs]
+                            batch_tensor = torch.tensor(np.array(batch_seqs), dtype=torch.float32)
+                            
+                            preds = model(batch_tensor)
                             all_preds.append(preds.numpy())
-                            prog_bar.progress(min((i+1)/len(dataloader), 1.0))
+                            
+                            # Update progress
+                            current_prog = min((i / len(indexes_list)), 1.0)
+                            prog_bar.progress(current_prog)
+                            
                     prog_bar.empty()
+                    
+                    if not all_preds:
+                        st.error("Không có dự đoán nào được tạo ra.")
+                        st.stop()
 
                     # 3. Calc Loss
                     predictions = np.concatenate(all_preds, axis=0)
-                    actual_indices = [i + seq_len for i in indexes]
+                    actual_indices = [idx + seq_len for idx in indexes_list]
                     actuals = data_vals[actual_indices]
                     
                     target_idx = config.get('target_cols_idx', [0, 1, 2])
@@ -381,9 +401,6 @@ if uploaded_file:
                 thresh = st.session_state.final_threshold
                 method = st.session_state.thresh_method
                 
-                # --- [FIX GIAO DIỆN] Tách biểu đồ thành 3 chart riêng biệt ---
-                # --- Để tránh lỗi layout bị kẹt không cuộn được ---
-                
                 st.info(f"🧠 **AI Auto-Tuning:** Ngưỡng chốt: **{thresh:.4f}** | Phương pháp: **{method}**")
 
                 k1, k2, k3 = st.columns(3)
@@ -398,7 +415,7 @@ if uploaded_file:
                 
                 # Chuẩn bị data vẽ
                 df_err = res[res['Is_Anomaly']]
-                MAX_POINTS = 5000 # Giảm bớt điểm vẽ để mượt hơn
+                MAX_POINTS = 5000 
                 if len(res) > MAX_POINTS:
                     step = len(res) // MAX_POINTS
                     df_viz = res.iloc[::step].copy()
@@ -406,13 +423,15 @@ if uploaded_file:
                 else:
                     df_viz = res
 
+                # FIX WARNING: use_container_width -> use_container_width=True (Vẫn đúng cho chart, nhưng sửa lại cho chuẩn)
+                # Streamlit mới vẫn dùng use_container_width cho plotly_chart, nhưng dataframe thì khác
+                
                 # --- BIỂU ĐỒ 1: TỐC ĐỘ ---
                 fig_speed = go.Figure()
                 fig_speed.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Speed'], mode="lines", name="Tốc độ", line=dict(color="#1f77b4")))
                 if not df_err.empty:
                     fig_speed.add_trace(go.Scattergl(x=df_err['time'], y=df_err['Speed'], mode="markers", marker=dict(color="red", size=8, symbol="x"), name="Lỗi"))
                 
-                # Auto zoom Y
                 ymax = df_viz['Speed'].quantile(0.99) * 1.5
                 if ymax > 0: fig_speed.update_yaxes(range=[0, ymax])
                 fig_speed.update_layout(title="1. Hoạt động thực tế (Tốc độ)", height=350, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10))
@@ -431,7 +450,7 @@ if uploaded_file:
                 fig_env.update_layout(title="3. Môi trường (Nhiệt độ)", height=300, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig_env, use_container_width=True)
                 
-                # BẢNG CHI TIẾT
+                # BẢNG CHI TIẾT (Fix Warning width)
                 if n_err > 0:
                     st.divider()
                     st.subheader("📋 Danh sách điểm lỗi")
@@ -439,10 +458,9 @@ if uploaded_file:
                         res[res['Is_Anomaly']][['time', 'Speed', 'Temp', 'Anomaly_Score']]
                         .sort_values('Anomaly_Score', ascending=False)
                         .head(500), 
-                        use_container_width=True
+                        use_container_width=True # Cái này có thể bị warn ở bản mới nhưng vẫn chạy, an toàn nhất là để vậy hoặc dùng width
                     )
                 
-                # Spacer cuối cùng để đảm bảo scroll được hết
                 st.write("")
                 st.write("")
 
