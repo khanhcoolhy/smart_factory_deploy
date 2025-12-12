@@ -19,6 +19,7 @@ from email.mime.multipart import MIMEMultipart
 # ===============================================================
 # 0. CẤU HÌNH & UTILS
 # ===============================================================
+# Ép PyTorch chạy 1 luồng để tiết kiệm CPU trên Cloud
 torch.set_num_threads(1)
 
 def get_gmail_secrets():
@@ -88,14 +89,16 @@ class LSTMPredictor(nn.Module):
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def process_and_enrich(df_input, _config):
-    # Hàm này TUYỆT ĐỐI không được chứa st.toast, st.error, st.write
+    # Lưu ý: Hàm cache không được chứa st.toast/st.error để tránh lỗi CacheReplayClosureError
     try:
         if 'data' in df_input.columns:
             def parse_safe(x):
                 try: return json.loads(str(x).replace("'", "\""))
                 except: return {}
+            # List comprehension nhanh hơn apply
             json_list = [parse_safe(x) for x in df_input['data']]
             json_df = pd.json_normalize(json_list)
+            # Reset index để concat chuẩn
             df_input = df_input.reset_index(drop=True)
             df_input = pd.concat([df_input[['DevAddr', 'time']], json_df], axis=1)
             del json_list, json_df
@@ -127,6 +130,7 @@ def process_and_enrich(df_input, _config):
                 if c not in df_subset.columns: df_subset[c] = 0
             
             df_subset = df_subset[required_cols]
+            # Downcast về float32 để tiết kiệm 50% RAM
             float_cols = ['Actual', 'Actual2', 'RunTime', 'HeldTime']
             df_subset[float_cols] = df_subset[float_cols].astype('float32')
             frames.append(df_subset)
@@ -140,10 +144,12 @@ def process_and_enrich(df_input, _config):
         
         grp = df.groupby('DevAddr')
         df['Speed'] = grp['Actual'].diff().fillna(0).astype('float32')
+        # Lọc nhiễu
         df = df[(df['Speed'] >= 0) & (df['Speed'] < 50000)].copy()
 
         if df.empty: return df
 
+        # Weather API (Thêm try/except để tránh sập nếu API lỗi)
         try:
             min_date = df['time'].min().strftime('%Y-%m-%d')
             max_date = df['time'].max().strftime('%Y-%m-%d')
@@ -174,12 +180,13 @@ def process_and_enrich(df_input, _config):
             df_final['Humidity'] = df_final['Humidity'].fillna(70.0).astype('float32')
             return df_final
         except Exception:
+            # Fallback nếu lỗi API thời tiết
             df['Temp'] = 25.0
             df['Humidity'] = 70.0
             return df
             
     except Exception as e:
-        print(f"Error in processing: {e}") # Dùng print thay vì st.error
+        print(f"Error processing data: {e}")
         return None
 
 # ==========================================
@@ -202,6 +209,7 @@ def load_system_components():
         scaler = joblib.load(scaler_path)
         
         model = LSTMPredictor(n_features=config['n_features'], hidden_dim=config['hidden_dim'])
+        # Quan trọng: map_location='cpu' để tránh lỗi CUDA trên máy không có GPU
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
         
@@ -213,7 +221,7 @@ def load_system_components():
 model, scaler, config = load_system_components()
 
 if not model:
-    st.error("⚠️ Không tìm thấy Model! Vui lòng kiểm tra lại file .pth và .pkl")
+    st.error("⚠️ Không tìm thấy Model! Vui lòng kiểm tra file .pth và .pkl")
     st.stop()
 
 # Session State
@@ -237,11 +245,11 @@ if uploaded_file:
 
     df_input = pd.read_csv(uploaded_file)
     
-    # --- XỬ LÝ CẮT DỮ LIỆU Ở NGOÀI (Main Thread) ---
+    # --- CƠ CHẾ BẢO VỆ: CẮT DỮ LIỆU NẾU QUÁ LỚN ---
     MAX_ROWS_INPUT = 50000
     if len(df_input) > MAX_ROWS_INPUT:
         df_input = df_input.tail(MAX_ROWS_INPUT).copy()
-        st.toast(f"⚠️ File quá lớn! Đã cắt lấy {MAX_ROWS_INPUT} dòng cuối.", icon="✂️")
+        st.toast(f"⚠️ File quá lớn! Đã cắt lấy {MAX_ROWS_INPUT} dòng cuối để đảm bảo hiệu năng.", icon="✂️")
     
     st.sidebar.success(f"Đã tải: {len(df_input):,} dòng")
 
@@ -249,7 +257,7 @@ if uploaded_file:
         df_processed = process_and_enrich(df_input, config)
 
     if df_processed is None:
-        st.error("Lỗi xử lý dữ liệu. Vui lòng kiểm tra lại file CSV.")
+        st.error("Có lỗi khi xử lý dữ liệu. Vui lòng kiểm tra file CSV.")
     elif not df_processed.empty:
         unique_dev_raw = df_processed['DevAddr'].unique()
         dev_map = {dev: f"{dev}_{i+1:02d}" for i, dev in enumerate(unique_dev_raw)}
@@ -273,10 +281,11 @@ if uploaded_file:
         df_machine = df_processed[df_processed['Label'] == selected_dev].sort_values('time')
 
         with st.expander("🔍 Xem dữ liệu thô"):
-            st.dataframe(df_machine.head(100), width=1000)
+            # Dùng use_container_width=True thay vì width cố định để responsive
+            st.dataframe(df_machine.head(100), use_container_width=True)
 
         if len(df_machine) < config['seq_length'] + 5:
-            st.warning(f"⚠️ Dữ liệu quá ngắn.")
+            st.warning(f"⚠️ Dữ liệu quá ngắn (Cần tối thiểu {config['seq_length']} dòng).")
         else:
             if st.button("🚀 BẮT ĐẦU PHÂN TÍCH", type="primary", use_container_width=True):
                 try:
@@ -295,13 +304,14 @@ if uploaded_file:
                     indexes_list = list(indexes)
                     
                     if not indexes_list:
-                        st.error("Dữ liệu không đủ sequence.")
+                        st.error("Không đủ dữ liệu để tạo chuỗi thời gian.")
                         st.stop()
 
-                    BATCH_SIZE = 32
+                    # --- TỐI ƯU RAM: XỬ LÝ THEO BATCH NHỎ ---
+                    BATCH_SIZE = 32 # Giữ batch nhỏ an toàn tuyệt đối cho Cloud Free
                     all_preds = []
                     
-                    prog_bar = st.progress(0, text="🤖 AI đang chạy...")
+                    prog_bar = st.progress(0, text="🤖 AI đang chạy (Chế độ tiết kiệm RAM)...")
                     
                     with torch.no_grad():
                         total = len(indexes_list)
@@ -309,14 +319,18 @@ if uploaded_file:
                             batch_idxs = indexes_list[i : i + BATCH_SIZE]
                             if not batch_idxs: break
                             
+                            # Tạo batch dữ liệu ngay tại chỗ (On-the-fly generation)
+                            # Không tạo mảng lớn trước -> Tiết kiệm 90% RAM
                             batch_seqs = np.array([data_vals[j : j + seq_len] for j in batch_idxs])
                             batch_tensor = torch.tensor(batch_seqs, dtype=torch.float32)
                             
                             preds = model(batch_tensor)
                             all_preds.append(preds.numpy())
                             
+                            # Xóa ngay lập tức khỏi bộ nhớ
                             del batch_seqs, batch_tensor, preds
                             
+                            # Cập nhật thanh tiến trình & Dọn rác
                             if i % (BATCH_SIZE * 5) == 0:
                                 prog_bar.progress(min((i + BATCH_SIZE) / total, 1.0))
                                 gc.collect()
@@ -324,7 +338,7 @@ if uploaded_file:
                     prog_bar.empty()
                     
                     if not all_preds:
-                        st.error("Lỗi dự đoán.")
+                        st.error("Lỗi: Không có dự đoán nào được tạo.")
                         st.stop()
 
                     # 3. Calc Loss
@@ -335,6 +349,7 @@ if uploaded_file:
                     target_idx = config.get('target_cols_idx', [0, 1, 2])
                     mae_loss = np.mean(np.abs(predictions[:, target_idx] - actuals[:, target_idx]), axis=1)
 
+                    # Giải phóng bộ nhớ sau khi tính xong
                     del predictions, actuals, all_preds
                     gc.collect()
 
@@ -343,6 +358,7 @@ if uploaded_file:
                     ai_loss_safe = np.nan_to_num(mae_loss, nan=0.0, posinf=0.0, neginf=0.0)
                     res['Anomaly_Score'] = ai_loss_safe.astype('float32')
                     
+                    # Logic ngưỡng động (Adaptive Threshold)
                     running_mask = res['Speed'] > 0.0
                     
                     if running_mask.sum() > 50:
@@ -350,6 +366,7 @@ if uploaded_file:
                         mean = np.mean(loss_run)
                         std = np.std(loss_run)
                         th_sigma = mean + 3 * std
+                        # Đảm bảo ngưỡng không quá thấp
                         final_thresh = max(float(th_sigma), 0.5)
                         best_method = "3-Sigma"
                     else:
@@ -367,6 +384,7 @@ if uploaded_file:
                     st.session_state.n_err = res['Is_Anomaly'].sum()
                     st.session_state.analysis_done = True
                     
+                    # Gửi báo cáo
                     n_err = st.session_state.n_err
                     status = "CÓ VẤN ĐỀ" if n_err > 0 else "ỔN ĐỊNH"
                     
@@ -376,8 +394,10 @@ if uploaded_file:
 
                 except Exception as e:
                     st.error(f"Lỗi Runtime: {str(e)}")
-                    print(e)
+                    # In lỗi chi tiết ra console server để debug
+                    print(f"CRITICAL ERROR: {e}")
 
+            # --- HIỂN THỊ KẾT QUẢ ---
             if st.session_state.analysis_done and st.session_state.res is not None:
                 res = st.session_state.res
                 n_err = st.session_state.n_err
@@ -394,29 +414,37 @@ if uploaded_file:
 
                 st.divider()
                 
+                # --- TỐI ƯU VẼ BIỂU ĐỒ ---
+                # Giới hạn số điểm vẽ để trình duyệt không bị treo
                 MAX_PLOT_POINTS = 2000
                 df_viz = res.copy()
                 if len(df_viz) > MAX_PLOT_POINTS:
                     step_viz = len(df_viz) // MAX_PLOT_POINTS
                     df_viz = df_viz.iloc[::step_viz]
                 
+                # Chart 1: Tốc độ
                 fig_speed = go.Figure()
-                fig_speed.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Speed'], mode="lines", name="Tốc độ"))
+                fig_speed.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Speed'], mode="lines", name="Tốc độ", line=dict(color="#1f77b4")))
+                
+                # Vẽ điểm lỗi (lấy từ dữ liệu gốc đầy đủ)
                 df_err = res[res['Is_Anomaly']]
                 if not df_err.empty:
-                     fig_speed.add_trace(go.Scattergl(x=df_err['time'], y=df_err['Speed'], mode="markers", marker=dict(color="red", size=8), name="Lỗi"))
+                     fig_speed.add_trace(go.Scattergl(x=df_err['time'], y=df_err['Speed'], mode="markers", marker=dict(color="red", size=8, symbol="x"), name="Lỗi"))
 
-                fig_speed.update_layout(title="Tốc độ máy", height=300, margin=dict(l=10, r=10, t=30, b=10))
+                fig_speed.update_layout(title="1. Hoạt động thực tế (Tốc độ)", height=300, margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig_speed, use_container_width=True)
 
+                # Chart 2: AI Score
                 fig_loss = go.Figure()
                 fig_loss.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Anomaly_Score'], mode="lines", name="AI Score", line=dict(color="purple")))
                 fig_loss.add_hline(y=thresh, line_dash="dash", line_color="red")
-                fig_loss.update_layout(title="Độ bất thường (AI Score)", height=300, margin=dict(l=10, r=10, t=30, b=10))
+                fig_loss.update_layout(title="2. Độ bất thường (AI Score)", height=300, margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig_loss, use_container_width=True)
 
+                # Bảng chi tiết lỗi
                 if n_err > 0:
-                    st.dataframe(res[res['Is_Anomaly']].head(200), use_container_width=True)
+                    st.subheader("📋 Danh sách điểm lỗi")
+                    st.dataframe(res[res['Is_Anomaly']].sort_values('Anomaly_Score', ascending=False).head(200), use_container_width=True)
 
     else:
         st.info("👈 Upload file CSV để bắt đầu.")
