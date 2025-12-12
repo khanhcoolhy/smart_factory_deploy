@@ -17,8 +17,11 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # ===============================================================
-# 0. CẤU HÌNH GMAIL & UTILS
+# 0. CẤU HÌNH & UTILS
 # ===============================================================
+# Ép PyTorch dùng 1 thread để tránh chiếm dụng CPU gây treo
+torch.set_num_threads(1)
+
 def get_gmail_secrets():
     try:
         user = st.secrets.get("GMAIL_USER") or os.environ.get("GMAIL_USER")
@@ -26,12 +29,11 @@ def get_gmail_secrets():
         receiver = st.secrets.get("RECEIVER_EMAIL") or os.environ.get("RECEIVER_EMAIL")
         return user, password, receiver
     except Exception:
-        return os.environ.get("GMAIL_USER"), os.environ.get("GMAIL_PASSWORD"), os.environ.get("RECEIVER_EMAIL")
+        return None, None, None
 
 def send_gmail_report(subject, message):
     sender_email, password, receiver_email = get_gmail_secrets()
     if not sender_email or not password or not receiver_email:
-        print("⚠️ Thiếu cấu hình Gmail. Bỏ qua gửi email.")
         return False
         
     msg = MIMEMultipart("alternative")
@@ -46,9 +48,7 @@ def send_gmail_report(subject, message):
         <div style="background-color: #f9f9f9; padding: 15px; border-left: 5px solid #d9534f;">
             <pre style="font-family: monospace; white-space: pre-wrap;">{message}</pre>
         </div>
-        <p style="font-size: 12px; color: gray; margin-top: 20px;">
-            Hệ thống Smart Factory AI (Adaptive Threshold).
-        </p>
+        <p style="font-size: 12px; color: gray; margin-top: 20px;">Hệ thống Smart Factory AI.</p>
       </body>
     </html>
     """
@@ -60,7 +60,7 @@ def send_gmail_report(subject, message):
             server.sendmail(sender_email, receiver_email, msg.as_string())
             return True
     except Exception as e:
-        print(f"❌ Lỗi gửi email: {e}")
+        print(f"Error sending email: {e}")
         return False
 
 # ==========================================
@@ -85,26 +85,36 @@ class LSTMPredictor(nn.Module):
         return prediction
 
 # ==========================================
-# 2. XỬ LÝ DỮ LIỆU
+# 2. XỬ LÝ DỮ LIỆU (TỐI ƯU RAM)
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def process_and_enrich(df_input, _config):
     try:
+        # --- OPTIMIZATION: Giới hạn input đầu vào ngay lập tức ---
+        MAX_ROWS_INPUT = 50000
+        if len(df_input) > MAX_ROWS_INPUT:
+            df_input = df_input.tail(MAX_ROWS_INPUT).copy()
+            st.toast(f"⚠️ File quá lớn! Đã cắt lấy {MAX_ROWS_INPUT} dòng cuối để phân tích.", icon="✂️")
+        
         if 'data' in df_input.columns:
             def parse_safe(x):
                 try: return json.loads(str(x).replace("'", "\""))
                 except: return {}
+            # Xử lý json từng dòng để tránh tạo list khổng lồ
             json_list = [parse_safe(x) for x in df_input['data']]
             json_df = pd.json_normalize(json_list)
+            # Reset index để concat đúng
+            df_input = df_input.reset_index(drop=True)
             df_input = pd.concat([df_input[['DevAddr', 'time']], json_df], axis=1)
             del json_list, json_df
             gc.collect()
 
         df_input['time'] = pd.to_datetime(df_input['time'], format='mixed', utc=True)
 
-        frames = []
+        # Lọc thiết bị chính (chỉ lấy thiết bị có nhiều dữ liệu nhất để demo nếu quá nhiều)
         unique_devices = df_input['DevAddr'].unique()
-
+        
+        frames = []
         for dev in unique_devices:
             mask = df_input['DevAddr'] == dev
             df_subset = df_input.loc[mask].copy()
@@ -127,29 +137,30 @@ def process_and_enrich(df_input, _config):
                 if c not in df_subset.columns: df_subset[c] = 0
             
             df_subset = df_subset[required_cols]
-            df_subset['Channel'] = ch 
+            # Downcast to float32 to save memory
             float_cols = ['Actual', 'Actual2', 'RunTime', 'HeldTime']
             df_subset[float_cols] = df_subset[float_cols].astype('float32')
             frames.append(df_subset)
 
         if not frames: return None
         df = pd.concat(frames, ignore_index=True)
+        del frames
+        gc.collect()
+
         df.sort_values(by=['DevAddr', 'time'], inplace=True)
         
         grp = df.groupby('DevAddr')
         df['Speed'] = grp['Actual'].diff().fillna(0).astype('float32')
-        df['d_RunTime'] = grp['RunTime'].diff().fillna(0).astype('float32')
-        df['d_HeldTime'] = grp['HeldTime'].diff().fillna(0).astype('float32')
-        
+        # Filter rác
         df = df[(df['Speed'] >= 0) & (df['Speed'] < 50000)].copy()
 
         if df.empty: return df
 
-        # Weather API
-        min_date = df['time'].min().strftime('%Y-%m-%d')
-        max_date = df['time'].max().strftime('%Y-%m-%d')
-
+        # Weather API (Giữ nguyên nhưng thêm try/except chặt)
         try:
+            min_date = df['time'].min().strftime('%Y-%m-%d')
+            max_date = df['time'].max().strftime('%Y-%m-%d')
+            
             cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
             retry_session = retry(cache_session, retries=3, backoff_factor=0.2)
             openmeteo = openmeteo_requests.Client(session=retry_session)
@@ -172,12 +183,15 @@ def process_and_enrich(df_input, _config):
                 "Humidity": hourly.Variables(1).ValuesAsNumpy().astype('float32')
             })
             df_final = pd.merge_asof(df.sort_values('time'), df_weather, on='time', direction='backward')
-            df_final[['Temp', 'Humidity']] = df_final[['Temp', 'Humidity']].ffill().bfill()
+            # Fill NA
+            df_final['Temp'] = df_final['Temp'].fillna(25.0).astype('float32')
+            df_final['Humidity'] = df_final['Humidity'].fillna(70.0).astype('float32')
             return df_final
-        except:
+        except Exception:
             df['Temp'] = 25.0
             df['Humidity'] = 70.0
             return df
+            
     except Exception as e:
         st.error(f"Lỗi xử lý dữ liệu: {str(e)}")
         return None
@@ -188,7 +202,6 @@ def process_and_enrich(df_input, _config):
 st.set_page_config(page_title="Smart Factory AI", layout="wide", page_icon="🏭")
 st.title("🏭 Hệ thống Giám sát Nhà máy thông minh (Smart AI)")
 
-# Load Model
 @st.cache_resource
 def load_system_components():
     try:
@@ -203,13 +216,10 @@ def load_system_components():
         scaler = joblib.load(scaler_path)
         
         model = LSTMPredictor(n_features=config['n_features'], hidden_dim=config['hidden_dim'])
-        model.load_state_dict(torch.load(model_path, map_location='cpu'))
+        # Load model với map_location cpu để tránh lỗi cuda
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
         
-        # --- FIX OOM: BỎ QUANTIZATION ĐỂ TRÁNH LỖI RAM & WARNING ---
-        # quantized_model = torch.quantization.quantize_dynamic(
-        #     model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
-        # )
         return model, scaler, config
     except Exception as e:
         st.error(f"Lỗi load model: {str(e)}")
@@ -218,7 +228,7 @@ def load_system_components():
 model, scaler, config = load_system_components()
 
 if not model:
-    st.error("⚠️ Không tìm thấy Model hoặc File Config! Hãy kiểm tra lại file .pkl và .pth")
+    st.error("⚠️ Không tìm thấy Model! Vui lòng kiểm tra lại file .pth và .pkl")
     st.stop()
 
 # Session State
@@ -247,7 +257,6 @@ if uploaded_file:
         df_processed = process_and_enrich(df_input, config)
 
     if df_processed is not None and not df_processed.empty:
-        # Labeling
         unique_dev_raw = df_processed['DevAddr'].unique()
         dev_map = {dev: f"{dev}_{i+1:02d}" for i, dev in enumerate(unique_dev_raw)}
         df_processed['Label'] = df_processed['DevAddr'].map(dev_map)
@@ -265,13 +274,13 @@ if uploaded_file:
         with col2:
             st.write("")
             st.write("")
+            # Turbo mode: skip step để nhanh hơn
             turbo_mode = st.checkbox("⚡ Chế độ Turbo", value=True)
 
         df_machine = df_processed[df_processed['Label'] == selected_dev].sort_values('time')
 
         with st.expander("🔍 Xem dữ liệu thô"):
-            # FIX WARNING: use_container_width -> width="stretch"
-            st.dataframe(df_machine.head(100), width=1000) 
+            st.dataframe(df_machine.head(100), width=1000)
 
         if len(df_machine) < config['seq_length'] + 5:
             st.warning(f"⚠️ Dữ liệu quá ngắn.")
@@ -287,45 +296,48 @@ if uploaded_file:
                     data_vals = scaler.transform(data_log)
                     
                     seq_len = config['seq_length']
-                    step_size = 10 if turbo_mode else 1
+                    step_size = 5 if turbo_mode else 1
                     
-                    # Create Indexes
                     indexes = range(0, len(data_vals) - seq_len, step_size)
                     indexes_list = list(indexes)
                     
                     if not indexes_list:
-                        st.error("Dữ liệu không đủ để tạo sequence.")
+                        st.error("Dữ liệu không đủ sequence.")
                         st.stop()
 
-                    # --- FIX OOM (CRASH): XỬ LÝ THEO BATCH NHỎ ---
-                    # Thay vì tạo mảng sequences khổng lồ cùng lúc, ta cắt nhỏ và dự đoán cuốn chiếu
-                    BATCH_SIZE = 512 # Giảm batch để nhẹ RAM
+                    # --- SIÊU TỐI ƯU RAM ---
+                    # Giảm Batch Size xuống mức an toàn tuyệt đối
+                    BATCH_SIZE = 32
                     all_preds = []
                     
-                    prog_bar = st.progress(0, text="🤖 AI đang phân tích (Chế độ tiết kiệm RAM)...")
+                    prog_bar = st.progress(0, text="🤖 AI đang chạy (Safe Mode)...")
                     
-                    total_batches = len(indexes_list) // BATCH_SIZE + 1
-                    
+                    # Tắt gradient để tiết kiệm RAM
                     with torch.no_grad():
-                        for i in range(0, len(indexes_list), BATCH_SIZE):
+                        total = len(indexes_list)
+                        for i in range(0, total, BATCH_SIZE):
                             batch_idxs = indexes_list[i : i + BATCH_SIZE]
                             if not batch_idxs: break
                             
-                            # Tạo batch dữ liệu ngay tại chỗ (On-the-fly)
-                            batch_seqs = [data_vals[j : j + seq_len] for j in batch_idxs]
-                            batch_tensor = torch.tensor(np.array(batch_seqs), dtype=torch.float32)
+                            # Tạo batch on-the-fly
+                            batch_seqs = np.array([data_vals[j : j + seq_len] for j in batch_idxs])
+                            batch_tensor = torch.tensor(batch_seqs, dtype=torch.float32)
                             
                             preds = model(batch_tensor)
                             all_preds.append(preds.numpy())
                             
+                            # Clean up ngay lập tức
+                            del batch_seqs, batch_tensor, preds
+                            
                             # Update progress
-                            current_prog = min((i / len(indexes_list)), 1.0)
-                            prog_bar.progress(current_prog)
+                            if i % (BATCH_SIZE * 5) == 0:
+                                prog_bar.progress(min((i + BATCH_SIZE) / total, 1.0))
+                                gc.collect() # Dọn rác bộ nhớ định kỳ
                             
                     prog_bar.empty()
                     
                     if not all_preds:
-                        st.error("Không có dự đoán nào được tạo ra.")
+                        st.error("Lỗi dự đoán.")
                         st.stop()
 
                     # 3. Calc Loss
@@ -336,12 +348,17 @@ if uploaded_file:
                     target_idx = config.get('target_cols_idx', [0, 1, 2])
                     mae_loss = np.mean(np.abs(predictions[:, target_idx] - actuals[:, target_idx]), axis=1)
 
-                    # 4. === SMART AUTO-THRESHOLDING ===
+                    # Free memory
+                    del predictions, actuals, all_preds
+                    gc.collect()
+
+                    # 4. Result DataFrame
                     res = df_machine.iloc[actual_indices].copy()
                     
                     ai_loss_safe = np.nan_to_num(mae_loss, nan=0.0, posinf=0.0, neginf=0.0)
                     res['Anomaly_Score'] = ai_loss_safe.astype('float32')
                     
+                    # Auto Threshold Logic
                     running_mask = res['Speed'] > 0.0
                     
                     if running_mask.sum() > 50:
@@ -349,23 +366,16 @@ if uploaded_file:
                         mean = np.mean(loss_run)
                         std = np.std(loss_run)
                         th_sigma = mean + 3 * std
-                        Q1 = np.nanpercentile(loss_run, 25)
-                        Q3 = np.nanpercentile(loss_run, 75)
-                        th_iqr = Q3 + 3 * (Q3 - Q1)
-                        th_perc = np.nanpercentile(loss_run, 99.5)
-                        
-                        candidates = {'3-Sigma': th_sigma, 'IQR': th_iqr, 'Percentile': th_perc}
-                        best_method = max(candidates, key=candidates.get)
-                        final_thresh = float(candidates[best_method])
-                        final_thresh = max(final_thresh, 1.0)
+                        final_thresh = max(float(th_sigma), 0.5)
+                        best_method = "3-Sigma"
                     else:
-                        final_thresh = 2.0
+                        final_thresh = 1.0
                         best_method = "Default"
 
                     st.session_state.final_threshold = final_thresh
                     st.session_state.thresh_method = best_method
                     
-                    # 5. Apply Logic
+                    # Apply
                     cond_ai = res['Anomaly_Score'] > final_thresh
                     cond_running = res['Speed'] > 0.1
                     res['Is_Anomaly'] = cond_ai & cond_running
@@ -374,95 +384,67 @@ if uploaded_file:
                     st.session_state.n_err = res['Is_Anomaly'].sum()
                     st.session_state.analysis_done = True
                     
-                    # 6. Email Report
+                    # Email
                     n_err = st.session_state.n_err
-                    loss_vnd = n_err * COST_PER_ERROR
                     status = "CÓ VẤN ĐỀ" if n_err > 0 else "ỔN ĐỊNH"
+                    msg_txt = f"Dev: {selected_dev} | Status: {status} | Errors: {n_err}"
                     
-                    msg = (
-                        f"Thiết bị: {selected_dev}\n"
-                        f"Trạng thái: {status}\n"
-                        f"Ngưỡng áp dụng: {final_thresh:.4f} ({best_method})\n"
-                        f"Số lỗi: {n_err}\n"
-                        f"Thiệt hại: {loss_vnd:,.0f} VND"
-                    )
-                    
-                    with st.spinner("Đang gửi email báo cáo..."):
-                        if send_gmail_report(f"AI REPORT: {status} | {selected_dev}", msg):
-                            st.toast(f"Đã gửi báo cáo qua Email! (Ngưỡng: {final_thresh:.2f})", icon="📧")
+                    # Gửi email trong background (thực ra là synchronous nhưng nhanh)
+                    if n_err > 0:
+                         send_gmail_report(f"AI ALERT: {selected_dev}", msg_txt)
 
                 except Exception as e:
-                    st.error(f"Lỗi: {str(e)}")
+                    st.error(f"Lỗi Runtime: {str(e)}")
+                    # Print full stack trace to logs
+                    import traceback
+                    traceback.print_exc()
 
-            # --- DISPLAY RESULTS ---
+            # --- DISPLAY ---
             if st.session_state.analysis_done and st.session_state.res is not None:
                 res = st.session_state.res
                 n_err = st.session_state.n_err
                 thresh = st.session_state.final_threshold
-                method = st.session_state.thresh_method
                 
-                st.info(f"🧠 **AI Auto-Tuning:** Ngưỡng chốt: **{thresh:.4f}** | Phương pháp: **{method}**")
+                st.info(f"🧠 **AI Tuning:** Ngưỡng: **{thresh:.4f}**")
 
                 k1, k2, k3 = st.columns(3)
                 with k1:
-                    if n_err == 0: st.success(f"TRẠNG THÁI\n# ỔN ĐỊNH ✅")
-                    else: st.error(f"TRẠNG THÁI\n# CÓ LỖI 🚨 ({n_err})")
+                    if n_err == 0: st.success("✅ ỔN ĐỊNH")
+                    else: st.error(f"🚨 {n_err} LỖI")
                 with k2: st.metric("Tỷ lệ lỗi", f"{(n_err/len(res))*100:.2f}%")
-                with k3: st.metric("Thiệt hại ước tính", f"{n_err * COST_PER_ERROR:,.0f} đ")
+                with k3: st.metric("Thiệt hại", f"{n_err * COST_PER_ERROR:,.0f} đ")
 
                 st.divider()
-                st.subheader("📊 Biểu đồ chi tiết")
                 
-                # Chuẩn bị data vẽ
-                df_err = res[res['Is_Anomaly']]
-                MAX_POINTS = 5000 
-                if len(res) > MAX_POINTS:
-                    step = len(res) // MAX_POINTS
-                    df_viz = res.iloc[::step].copy()
-                    df_viz = pd.concat([df_viz, df_err]).drop_duplicates(subset=['time']).sort_values('time')
-                else:
-                    df_viz = res
-
-                # FIX WARNING: use_container_width -> use_container_width=True (Vẫn đúng cho chart, nhưng sửa lại cho chuẩn)
-                # Streamlit mới vẫn dùng use_container_width cho plotly_chart, nhưng dataframe thì khác
+                # --- GIỚI HẠN SỐ ĐIỂM VẼ ĐỂ KHÔNG TREO TRÌNH DUYỆT ---
+                # Chỉ lấy tối đa 2000 điểm để vẽ, ưu tiên các điểm lỗi
+                MAX_PLOT_POINTS = 2000
+                df_viz = res.copy()
+                if len(df_viz) > MAX_PLOT_POINTS:
+                    # Lấy mẫu: cứ N dòng lấy 1
+                    step_viz = len(df_viz) // MAX_PLOT_POINTS
+                    df_viz = df_viz.iloc[::step_viz]
                 
-                # --- BIỂU ĐỒ 1: TỐC ĐỘ ---
+                # Biểu đồ 1
                 fig_speed = go.Figure()
-                fig_speed.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Speed'], mode="lines", name="Tốc độ", line=dict(color="#1f77b4")))
+                fig_speed.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Speed'], mode="lines", name="Tốc độ"))
+                # Thêm điểm lỗi đỏ (nếu có)
+                df_err = res[res['Is_Anomaly']]
                 if not df_err.empty:
-                    fig_speed.add_trace(go.Scattergl(x=df_err['time'], y=df_err['Speed'], mode="markers", marker=dict(color="red", size=8, symbol="x"), name="Lỗi"))
-                
-                ymax = df_viz['Speed'].quantile(0.99) * 1.5
-                if ymax > 0: fig_speed.update_yaxes(range=[0, ymax])
-                fig_speed.update_layout(title="1. Hoạt động thực tế (Tốc độ)", height=350, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10))
+                     fig_speed.add_trace(go.Scattergl(x=df_err['time'], y=df_err['Speed'], mode="markers", marker=dict(color="red", size=8), name="Lỗi"))
+
+                fig_speed.update_layout(title="Tốc độ máy", height=300, margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig_speed, use_container_width=True)
 
-                # --- BIỂU ĐỒ 2: AI SCORE ---
+                # Biểu đồ 2
                 fig_loss = go.Figure()
-                fig_loss.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Anomaly_Score'], mode="lines", name="AI Score", line=dict(color="#9467bd"), fill='tozeroy'))
-                fig_loss.add_hline(y=thresh, line_dash="dash", line_color="red", annotation_text=f"Ngưỡng: {thresh:.2f}")
-                fig_loss.update_layout(title="2. Điểm số bất thường của AI (Càng cao càng lỗi)", height=300, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10))
+                fig_loss.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Anomaly_Score'], mode="lines", name="AI Score", line=dict(color="purple")))
+                fig_loss.add_hline(y=thresh, line_dash="dash", line_color="red")
+                fig_loss.update_layout(title="Độ bất thường (AI Score)", height=300, margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig_loss, use_container_width=True)
 
-                # --- BIỂU ĐỒ 3: MÔI TRƯỜNG ---
-                fig_env = go.Figure()
-                fig_env.add_trace(go.Scattergl(x=df_viz['time'], y=df_viz['Temp'], mode="lines", name="Nhiệt độ", line=dict(color="orange")))
-                fig_env.update_layout(title="3. Môi trường (Nhiệt độ)", height=300, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10))
-                st.plotly_chart(fig_env, use_container_width=True)
-                
-                # BẢNG CHI TIẾT (Fix Warning width)
                 if n_err > 0:
-                    st.divider()
-                    st.subheader("📋 Danh sách điểm lỗi")
-                    st.dataframe(
-                        res[res['Is_Anomaly']][['time', 'Speed', 'Temp', 'Anomaly_Score']]
-                        .sort_values('Anomaly_Score', ascending=False)
-                        .head(500), 
-                        use_container_width=True # Cái này có thể bị warn ở bản mới nhưng vẫn chạy, an toàn nhất là để vậy hoặc dùng width
-                    )
-                
-                st.write("")
-                st.write("")
+                    st.dataframe(res[res['Is_Anomaly']].head(200), use_container_width=True)
 
     else:
-        st.info("👈 Vui lòng upload file CSV.")
+        st.info("👈 Upload file CSV để bắt đầu.")

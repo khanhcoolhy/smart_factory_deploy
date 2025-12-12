@@ -1,14 +1,15 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 streamlit
 pandas
-# QUAN TRỌNG: Khóa cứng Numpy bản cũ để chạy được Scikit-learn 1.2.2
 numpy==1.24.4
 joblib
 plotly
 openmeteo-requests
 requests-cache
 retry-requests
-requests
+# Requests bản cũ để tương thích tốt hơn
+requests==2.31.0
+# Ép urllib3 bản thấp để không xung đột với requests
 urllib3<2.0.0
 scikit-learn==1.2.2
 torch
