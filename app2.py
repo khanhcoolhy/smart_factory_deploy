@@ -218,11 +218,10 @@ def load_system_components():
         model.load_state_dict(torch.load(model_path, map_location='cpu'))
         model.eval()
         
-        # Quantize để chạy nhanh hơn trên CPU
-        quantized_model = torch.quantization.quantize_dynamic(
-            model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
-        )
-        return quantized_model, scaler, config
+        # --- [ĐÃ SỬA] Bỏ Quantization để fix lỗi "min should be less than max" ---
+        # Do dữ liệu đầu vào có thể bị constant (biến thiên = 0), gây lỗi cho bộ quantizer
+        return model, scaler, config
+        
     except Exception as e:
         st.error(f"Lỗi load model: {str(e)}")
         return None, None, None
