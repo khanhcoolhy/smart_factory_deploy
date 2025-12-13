@@ -207,10 +207,10 @@ def load_system_components():
         model.load_state_dict(torch.load(model_path, map_location='cpu'))
         model.eval()
         
-        #quantized_model = torch.quantization.quantize_dynamic(
-            #model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
-        #)
-        return model, scaler, config
+        quantized_model = torch.quantization.quantize_dynamic(
+            model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
+        )
+        return quantized_model, scaler, config
     except Exception as e:
         st.error(f"Lỗi load model: {str(e)}")
         return None, None, None
