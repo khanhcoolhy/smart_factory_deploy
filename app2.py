@@ -207,10 +207,10 @@ def load_system_components():
         model.load_state_dict(torch.load(model_path, map_location='cpu'))
         model.eval()
         
-        quantized_model = torch.quantization.quantize_dynamic(
-            model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
-        )
-        return quantized_model, scaler, config
+        #quantized_model = torch.quantization.quantize_dynamic(
+            #model, {nn.Linear, nn.LSTM}, dtype=torch.qint8
+        #)
+        return model, scaler, config
     except Exception as e:
         st.error(f"Lỗi load model: {str(e)}")
         return None, None, None
@@ -229,6 +229,9 @@ if 'analysis_done' not in st.session_state:
     st.session_state.final_threshold = 0.0
     st.session_state.thresh_method = ""
     st.session_state.selected_dev = None 
+# --- THÊM DÒNG NÀY ---
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
 
 # Sidebar
 st.sidebar.header("📥 Dữ liệu đầu vào")
@@ -275,8 +278,29 @@ if uploaded_file:
         if len(df_machine) < config['seq_length'] + 5:
             st.warning(f"⚠️ Dữ liệu quá ngắn.")
         else:
-            if st.button("🚀 BẮT ĐẦU PHÂN TÍCH", type="primary", use_container_width=True):
+            # --- CODE MỚI BẮT ĐẦU TỪ ĐÂY ---
+            
+            # 1. Hàm Callback để bật trạng thái đang xử lý
+            def start_analysis_click():
+                st.session_state.processing = True
+                st.session_state.analysis_done = False # Reset kết quả cũ
+
+            # 2. Hiển thị nút bấm (Disabled nếu đang processing)
+            st.button(
+                "🚀 BẮT ĐẦU PHÂN TÍCH", 
+                type="primary", 
+                use_container_width=True,
+                disabled=st.session_state.processing, # Mờ đi khi đang chạy
+                on_click=start_analysis_click # Gọi hàm callback khi bấm
+            )
+
+            # 3. Logic chạy phân tích (Kiểm tra trạng thái thay vì kiểm tra nút bấm)
+            if st.session_state.processing:
                 try:
+                    # ==========================================
+                    # BẮT ĐẦU LOGIC CŨ CỦA BẠN (COPY PASTE VÀO ĐÂY)
+                    # ==========================================
+                    
                     # 1. Prepare Data
                     req_cols = config['features_list']
                     for c in req_cols:
@@ -292,6 +316,7 @@ if uploaded_file:
 
                     if not sequences:
                         st.error("Lỗi tạo sequence.")
+                        st.session_state.processing = False # Tắt trạng thái nếu lỗi
                         st.stop()
 
                     X_input = torch.tensor(np.array(sequences), dtype=torch.float32)
@@ -300,7 +325,7 @@ if uploaded_file:
 
                     # 2. Run Model
                     all_preds = []
-                    prog_bar = st.progress(0, text="🤖 AI đang phân tích...")
+                    prog_bar = st.progress(0, text="🤖 AI đang phân tích (Vui lòng đợi)...")
                     with torch.no_grad():
                         for i, batch in enumerate(dataloader):
                             preds = model(batch[0])
@@ -367,12 +392,20 @@ if uploaded_file:
                         f"Thiệt hại: {loss_vnd:,.0f} VND"
                     )
                     
+                    # Gửi mail
                     with st.spinner("Đang gửi email báo cáo..."):
                         if send_gmail_report(f"AI REPORT: {status} | {selected_dev}", msg):
                             st.toast(f"Đã gửi báo cáo qua Email! (Ngưỡng: {final_thresh:.2f})", icon="📧")
 
                 except Exception as e:
                     st.error(f"Lỗi: {str(e)}")
+                
+                finally:
+                    # Quan trọng: Tắt cờ processing và rerun để nút sáng lại
+                    st.session_state.processing = False
+                    st.rerun()
+
+            # --- KẾT THÚC CODE MỚI ---
 
             # --- DISPLAY RESULTS ---
             if st.session_state.analysis_done and st.session_state.res is not None:
